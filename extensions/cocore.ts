@@ -1,4 +1,19 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import {
+  createAssistantMessageEventStream,
+  calculateCost,
+  type AssistantMessageEventStream,
+  type Context,
+  type Model,
+  type SimpleStreamOptions,
+  type Api,
+  type AssistantMessage,
+  type StopReason,
+  type ToolCall,
+  type Message,
+  type Tool,
+  type Usage,
+} from "@earendil-works/pi-ai";
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
@@ -8,6 +23,593 @@ import { homedir } from "node:os";
 const BASE_URL = "https://console.cocore.dev/api/v1";
 const CONFIG_DIR = join(homedir(), ".pi", "agent");
 const CONFIG_PATH = join(CONFIG_DIR, "cocore-config.json");
+
+// ── Retry configuration ──────────────────────────────────────────────────────
+
+/** Maximum number of retry attempts for failed requests. */
+const MAX_RETRIES = 3;
+
+/** Base delay in ms for exponential backoff. */
+const RETRY_BASE_DELAY_MS = 1000;
+
+/** HTTP status codes that should be retried. */
+const RETRYABLE_STATUS_CODES = new Set([
+  408, // Request Timeout
+  425, // Too Early
+  429, // Too Many Requests
+  500, // Internal Server Error
+  502, // Bad Gateway
+  503, // Service Unavailable
+  504, // Gateway Timeout
+]);
+
+/**
+ * Check whether an error should trigger a retry.
+ */
+function isRetryableError(status: number, errorMessage?: string): boolean {
+  if (RETRYABLE_STATUS_CODES.has(status)) return true;
+  if (errorMessage) {
+    const lower = errorMessage.toLowerCase();
+    if (lower.includes("idle-timeout") || lower.includes("idle_timeout")) return true;
+    if (lower.includes("timeout") || lower.includes("timed out")) return true;
+    if (lower.includes("rate limit") || lower.includes("too many requests")) return true;
+  }
+  return false;
+}
+
+/**
+ * Sleep for `ms` milliseconds.
+ */
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Calculate the backoff delay for a given retry attempt.
+ * Uses exponential backoff with jitter: base * 2^attempt + random jitter.
+ */
+function backoffDelay(attempt: number): number {
+  const exp = Math.min(attempt, 10); // Cap exponent to prevent overflow
+  const base = RETRY_BASE_DELAY_MS * Math.pow(2, exp);
+  const jitter = Math.random() * base * 0.5;
+  return base + jitter;
+}
+
+// ── Custom streaming with retry ─────────────────────────────────────────────
+
+/**
+ * Build tool instructions for Gemma or Qwen models and inject them
+ * into the context's system prompt. Returns a copy of the context with
+ * modified system prompt if tools are present and model family matches.
+ */
+function injectToolInstructions(
+  context: Context,
+  modelFamily: "gemma" | "qwen",
+): Context {
+  if (!context.tools || context.tools.length === 0) return context;
+
+  const piTools = context.tools as Tool<any>[];
+  // Convert Tool objects to the format expected by instruction builders
+  const toolDescs = piTools.map((t) => ({
+    type: "function" as const,
+    function: {
+      name: t.name,
+      description: t.description,
+      parameters: t.parameters as any,
+    },
+  }));
+
+  const instructions =
+    modelFamily === "qwen"
+      ? buildQwenToolInstructions(toolDescs)
+      : buildGemmaToolInstructions(toolDescs);
+
+  // Check if instructions are already injected
+  const existingCheck = "You have access to the following functions. To call a function, you MUST";
+  if (context.systemPrompt && context.systemPrompt.includes(existingCheck)) {
+    return context;
+  }
+
+  return {
+    ...context,
+    systemPrompt: (context.systemPrompt ?? "") + instructions,
+    // Don't send tools in OpenAI format — the model uses text instructions
+    tools: undefined,
+  };
+}
+
+/**
+ * Convert pi's internal message format to OpenAI Chat Completions format.
+ */
+function convertMessagesForOpenAI(messages: Message[]): unknown[] {
+  const result: unknown[] = [];
+
+  for (let i = 0; i < messages.length; i++) {
+    const msg = messages[i];
+
+    if (msg.role === "user") {
+      if (typeof msg.content === "string") {
+        result.push({ role: "user", content: msg.content });
+      } else {
+        const parts = msg.content.map((c) => {
+          if (c.type === "text") return { type: "text", text: c.text };
+          return {
+            type: "image_url",
+            image_url: { url: `data:${c.mimeType};base64,${c.data}` },
+          };
+        });
+        result.push({ role: "user", content: parts });
+      }
+    } else if (msg.role === "assistant") {
+      const content: unknown[] = [];
+      const toolCalls: unknown[] = [];
+      for (const block of msg.content) {
+        if (block.type === "text") {
+          content.push({ type: "text", text: block.text });
+        } else if (block.type === "thinking") {
+          // Convert thinking to text for OpenAI compat
+          content.push({ type: "text", text: `<thinking>${block.thinking}</thinking>` });
+        } else if (block.type === "toolCall") {
+          toolCalls.push({
+            id: block.id,
+            type: "function",
+            function: {
+              name: block.name,
+              arguments: JSON.stringify(block.arguments),
+            },
+          });
+        }
+      }
+      const assistantMsg: Record<string, unknown> = {
+        role: "assistant",
+        content: content.length > 0 ? content : null,
+      };
+      if (toolCalls.length > 0) {
+        assistantMsg.tool_calls = toolCalls;
+      }
+      result.push(assistantMsg);
+    } else if (msg.role === "toolResult") {
+      const content = msg.content
+        .filter((c) => c.type === "text")
+        .map((c) => c.text)
+        .join("\n");
+      result.push({
+        role: "tool",
+        tool_call_id: msg.toolCallId,
+        content,
+      });
+    }
+  }
+
+  return result;
+}
+
+/**
+ * Custom streaming implementation for Co/Core provider with retry logic.
+ *
+ * Handlers:
+ * - Injects tool-calling instructions for Gemma/Qwen models
+ * - Retries on idle-timeout and transient server errors
+ * - Parses OpenAI-compatible SSE stream
+ */
+function streamCocore(
+  model: Model<Api>,
+  context: Context,
+  options?: SimpleStreamOptions,
+): AssistantMessageEventStream {
+  const stream = createAssistantMessageEventStream();
+
+  (async () => {
+    const maxRetries = options?.maxRetries ?? MAX_RETRIES;
+    const signal = options?.signal;
+    const apiKey = options?.apiKey;
+
+    // Detect model family for tool instruction injection
+    const family = getModelFamily(model.id);
+    const effectiveContext = family
+      ? injectToolInstructions(context, family)
+      : context;
+
+    const output: AssistantMessage = {
+      role: "assistant",
+      content: [],
+      api: model.api,
+      provider: model.provider,
+      model: model.id,
+      usage: {
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        totalTokens: 0,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+      },
+      stopReason: "stop",
+      timestamp: Date.now(),
+    };
+
+    let lastErrorMessage: string | undefined;
+    let textContentIndex: number | null;
+    const toolCallAccumulators: Map<
+      number,
+      { id: string; name: string; json: string; contentIdx: number }
+    > = new Map();
+
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      if (signal?.aborted) {
+        output.stopReason = "aborted";
+        output.errorMessage = "Request was aborted";
+        stream.push({ type: "error", reason: "aborted", error: output });
+        stream.end();
+        return;
+      }
+
+      if (attempt > 0) {
+        const delay = backoffDelay(attempt - 1);
+        console.log(
+          `[cocore] Retry attempt ${attempt}/${maxRetries} after ${Math.round(delay)}ms (previous error: ${lastErrorMessage})`,
+        );
+        await sleep(delay);
+
+        // Re-check abort after waiting
+        if (signal?.aborted) {
+          output.stopReason = "aborted";
+          output.errorMessage = "Request was aborted";
+          stream.push({ type: "error", reason: "aborted", error: output });
+          stream.end();
+          return;
+        }
+      }
+
+      try {
+        // Reset output content for this attempt (in case of retry)
+        output.content = [];
+        output.usage = {
+          input: 0,
+          output: 0,
+          cacheRead: 0,
+          cacheWrite: 0,
+          totalTokens: 0,
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+        };
+        output.stopReason = "stop";
+
+        // Build request payload
+        const messages = convertMessagesForOpenAI(effectiveContext.messages);
+        if (effectiveContext.systemPrompt) {
+          messages.unshift({
+            role: "system",
+            content: effectiveContext.systemPrompt,
+          });
+        }
+
+        const body: Record<string, unknown> = {
+          model: model.id,
+          messages,
+          stream: true,
+          stream_options: { include_usage: true },
+        };
+
+        if (options?.maxTokens) {
+          body.max_tokens = options.maxTokens;
+        }
+        if (options?.temperature !== undefined) {
+          body.temperature = options.temperature;
+        }
+
+        // Only include tools in OpenAI format for non-Gemma/Qwen models
+        if (!family && effectiveContext.tools && effectiveContext.tools.length > 0) {
+          body.tools = effectiveContext.tools.map((t: Tool<any>) => ({
+            type: "function",
+            function: {
+              name: t.name,
+              description: t.description,
+              parameters: t.parameters,
+            },
+          }));
+        }
+
+        console.log(`[cocore] sending request (attempt ${attempt + 1}/${maxRetries + 1})`);
+
+        const headers: Record<string, string> = {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${apiKey}`,
+        };
+
+        // Merge model-level and provider-level headers
+        if (model.headers) Object.assign(headers, model.headers);
+        if (options?.headers) Object.assign(headers, options.headers);
+
+        const fetchTimeout = options?.timeoutMs ?? 600_000; // Default 10 min
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), fetchTimeout);
+
+        // Link to parent abort signal if provided
+        const onAbort = () => controller.abort();
+        signal?.addEventListener("abort", onAbort, { once: true });
+
+        let response: Response;
+        try {
+          response = await fetch(`${model.baseUrl || BASE_URL}/chat/completions`, {
+            method: "POST",
+            headers,
+            body: JSON.stringify(body),
+            signal: controller.signal,
+          });
+        } finally {
+          clearTimeout(timeoutId);
+          signal?.removeEventListener("abort", onAbort);
+        }
+
+        if (!response.ok) {
+          const errorText = await response.text().catch(() => "");
+          lastErrorMessage = errorText.slice(0, 500);
+
+          if (isRetryableError(response.status, errorText) && attempt < maxRetries) {
+            console.log(
+              `[cocore] Request failed with status ${response.status}: ${errorText.slice(0, 200)}. Will retry.`,
+            );
+            continue; // Retry
+          }
+
+          // Not retryable, or exhausted retries
+          output.stopReason = "error";
+          output.errorMessage =
+            `HTTP ${response.status}${response.statusText ? ` ${response.statusText}` : ""}: ${errorText.slice(0, 300)}`;
+          stream.push({ type: "error", reason: "error", error: output });
+          stream.end();
+          return;
+        }
+
+        // Success — parse the SSE stream
+        stream.push({ type: "start", partial: output });
+
+        const reader = response.body?.getReader();
+        if (!reader) {
+          throw new Error("Response body is not readable");
+        }
+
+        const decoder = new TextDecoder();
+        let buffer = "";
+        textContentIndex = null;
+        toolCallAccumulators.clear();
+
+        try {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+
+            buffer += decoder.decode(value, { stream: true });
+
+            // Process complete SSE lines
+            const lines = buffer.split("\n");
+            // Keep the last (potentially incomplete) line in the buffer
+            buffer = lines.pop() || "";
+
+            for (const line of lines) {
+              if (!line.startsWith("data: ")) continue;
+              const data = line.slice(6).trim();
+              if (data === "[DONE]") continue;
+
+              let chunk: Record<string, unknown>;
+              try {
+                chunk = JSON.parse(data);
+              } catch {
+                continue;
+              }
+
+              const choices = chunk.choices as
+                | Array<Record<string, unknown>>
+                | undefined;
+              if (!choices || choices.length === 0) continue;
+              const choice = choices[0];
+              const delta = choice.delta as Record<string, unknown> | undefined;
+
+              // Handle usage info
+              if (chunk.usage) {
+                const u = chunk.usage as Record<string, unknown>;
+                output.usage.input = (u.prompt_tokens as number) ?? 0;
+                output.usage.output = (u.completion_tokens as number) ?? 0;
+                const details = u.prompt_tokens_details as Record<string, number> | undefined;
+                output.usage.cacheRead = details?.cached_tokens ?? 0;
+                output.usage.totalTokens =
+                  output.usage.input +
+                  output.usage.output +
+                  output.usage.cacheRead +
+                  output.usage.cacheWrite;
+                calculateCost(model, output.usage as Usage);
+              }
+
+              // Handle finish reason
+              if (choice.finish_reason) {
+                const reason = choice.finish_reason as string;
+                if (reason === "tool_calls") {
+                  output.stopReason = "toolUse";
+                } else if (reason === "length") {
+                  output.stopReason = "length";
+                } else if (reason === "stop") {
+                  output.stopReason = "stop";
+                }
+              }
+
+              if (!delta || Object.keys(delta as Record<string, unknown>).length === 0) continue;
+
+              // Text content
+              if (delta.content) {
+                if (textContentIndex === null) {
+                  textContentIndex = output.content.length;
+                  output.content.push({ type: "text", text: "" });
+                  stream.push({
+                    type: "text_start",
+                    contentIndex: textContentIndex,
+                    partial: output,
+                  });
+                }
+                const block = output.content[textContentIndex];
+                if (block.type === "text") {
+                  block.text += delta.content as string;
+                  stream.push({
+                    type: "text_delta",
+                    contentIndex: textContentIndex,
+                    delta: delta.content as string,
+                    partial: output,
+                  });
+                }
+              }
+
+              // Tool calls
+              const toolCalls = delta.tool_calls as
+                | Array<Record<string, unknown>>
+                | undefined;
+              if (toolCalls) {
+                for (const tc of toolCalls) {
+                  const idx = tc.index as number;
+
+                  let accum = toolCallAccumulators.get(idx);
+                  if (!accum) {
+                    const contentIdx = output.content.length;
+                    accum = {
+                      id: (tc.id as string) || "",
+                      name: "",
+                      json: "",
+                      contentIdx,
+                    };
+                    toolCallAccumulators.set(idx, accum);
+
+                    // Add placeholder to output content
+                    output.content.push({
+                      type: "toolCall",
+                      id: accum.id,
+                      name: "",
+                      arguments: {},
+                    });
+                    stream.push({
+                      type: "toolcall_start",
+                      contentIndex: contentIdx,
+                      partial: output,
+                    });
+                  }
+
+                  if (tc.id) accum.id = tc.id as string;
+
+                  const fn = tc.function as Record<string, unknown> | undefined;
+                  if (fn) {
+                    if (fn.name) accum.name = fn.name as string;
+                    if (fn.arguments) accum.json += fn.arguments as string;
+                  }
+
+                  const block = output.content[accum.contentIdx];
+                  if (block && block.type === "toolCall") {
+                    block.id = accum.id;
+                    block.name = accum.name;
+                    try {
+                      block.arguments = JSON.parse(accum.json);
+                    } catch {
+                      // Partial JSON — keep previous parse result
+                    }
+                    stream.push({
+                      type: "toolcall_delta",
+                      contentIndex: accum.contentIdx,
+                      delta: (fn?.arguments as string) ?? "",
+                      partial: output,
+                    });
+                  }
+                }
+              }
+            }
+          }
+        } finally {
+          reader.releaseLock();
+        }
+
+        // End text block if one was started
+        if (textContentIndex !== null) {
+          const block = output.content[textContentIndex];
+          if (block && block.type === "text") {
+            stream.push({
+              type: "text_end",
+              contentIndex: textContentIndex,
+              content: block.text,
+              partial: output,
+            });
+          }
+        }
+
+        // End any tool call blocks
+        for (const [_idx, accum] of toolCallAccumulators) {
+          const block = output.content[accum.contentIdx];
+          if (block && block.type === "toolCall") {
+            try {
+              block.arguments = JSON.parse(accum.json);
+            } catch {
+              // Keep whatever was parsed
+            }
+            stream.push({
+              type: "toolcall_end",
+              contentIndex: accum.contentIdx,
+              toolCall: block as ToolCall,
+              partial: output,
+            });
+          }
+        }
+
+        // Success!
+        const hasContent =
+          output.content.length > 0 ||
+          output.usage.totalTokens > 0;
+
+        if (!hasContent && attempt < maxRetries) {
+          // Empty response — likely idle-timeout on the server
+          lastErrorMessage = "empty response (likely idle-timeout)";
+          console.log(
+            `[cocore] Empty response received (0 content, 0 tokens). Will retry.`,
+          );
+          continue; // Retry
+        }
+
+        stream.push({
+          type: "done",
+          reason: output.stopReason as Extract<StopReason, "stop" | "length" | "toolUse">,
+          message: output,
+        });
+        stream.end();
+        return;
+      } catch (err) {
+        lastErrorMessage = err instanceof Error ? err.message : String(err);
+
+        if (signal?.aborted) {
+          output.stopReason = "aborted";
+          output.errorMessage = "Request was aborted";
+          stream.push({ type: "error", reason: "aborted", error: output });
+          stream.end();
+          return;
+        }
+
+        if (attempt < maxRetries) {
+          console.log(
+            `[cocore] Request error: ${lastErrorMessage}. Will retry.`,
+          );
+          continue; // Retry on network errors
+        }
+
+        // Exhausted retries
+        output.stopReason = "error";
+        output.errorMessage = lastErrorMessage;
+        stream.push({ type: "error", reason: "error", error: output });
+        stream.end();
+        return;
+      }
+    }
+
+    // Should not reach here, but handle it
+    output.stopReason = "error";
+    output.errorMessage = lastErrorMessage ?? "Unknown error after retries";
+    stream.push({ type: "error", reason: "error", error: output });
+    stream.end();
+  })();
+
+  return stream;
+}
 
 // ── Model detection ──────────────────────────────────────────────────────────
 
@@ -580,6 +1182,7 @@ async function registerCocoreProvider(pi: ExtensionAPI, apiKey: string): Promise
     apiKey,
     api: "openai-completions",
     models,
+    streamSimple: streamCocore,
   });
 
   return models.length;
@@ -676,66 +1279,9 @@ function registerEventHandlers(pi: ExtensionAPI) {
   if (handlersRegistered) return;
   handlersRegistered = true;
 
-  // ── Inject tool-calling instructions into the prompt ────────────────────
-  // Co/Core's OpenAI-compatible API does not translate tool definitions
-  // into model-native format for Gemma and Qwen models. We inject text
-  // instructions into the system prompt and strip the tools array so the
-  // models understand how to call tools.
-  pi.on("before_provider_request", (event, ctx) => {
-    if (ctx.model?.provider !== "cocore") return;
-
-    const modelId = ctx.model.id.toLowerCase();
-    const family = getModelFamily(modelId);
-    if (!family) return; // Not a Gemma or Qwen model (e.g., Llama)
-
-    const payload = event.payload as Record<string, unknown>;
-    const tools = payload.tools as Array<{ type: string; function: { name: string; description?: string; parameters?: { type: string; properties?: Record<string, { type?: string; description?: string }>; required?: string[] } } }> | undefined;
-    if (!tools || tools.length === 0) return;
-
-    // Build tool format instructions
-    const instructions =
-      family === "qwen"
-        ? buildQwenToolInstructions(tools)
-        : buildGemmaToolInstructions(tools);
-
-    // Append to the system/developer message, or insert one if missing
-    const messages = payload.messages as Array<{ role: string; content: string | Array<{ type: string; text?: string }> }> | undefined;
-    if (messages && messages.length > 0) {
-      let found = false;
-      for (const msg of messages) {
-        if (msg.role === "system" || msg.role === "developer") {
-          // Check if we already injected instructions in a previous turn.
-          // Our instructions always contain this unique phrase.
-          const existing = typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content);
-          if (existing.includes("You have access to the following functions. To call a function, you MUST")) {
-            found = true;
-            break;
-          }
-          if (typeof msg.content === "string") {
-            msg.content += instructions;
-          } else if (Array.isArray(msg.content)) {
-            msg.content.push({ type: "text", text: instructions });
-          }
-          found = true;
-          break;
-        }
-      }
-      // If no system/developer message exists, prepend one
-      if (!found) {
-        messages.unshift({ role: "system", content: instructions });
-      }
-    } else {
-      // No messages array — create one with a system message
-      payload.messages = [{ role: "system", content: instructions }];
-    }
-
-    // Strip the tools array — model doesn't understand OpenAI tool format
-    delete payload.tools;
-    // Also strip tool_choice if present
-    delete payload.tool_choice;
-
-    return payload;
-  });
+  // ── Tool-calling instructions are now injected in the custom stream ───
+  // The streamCocore function handles Gemma/Qwen tool instruction injection
+  // and strips the tools array before sending to the API.
 
   // ── Fix tool calls in text content for all cocore models ──────────────
   // Gemma and Qwen models output tool calls as text tokens instead of
