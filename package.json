@@ -1,0 +1,14 @@
+{
+  "name": "pi-cocore",
+  "version": "1.0.0",
+  "description": "Co/Core provider for pi — run open-source models on Apple Silicon via cocore.dev",
+  "keywords": ["pi-package", "cocore", "mlx", "apple-silicon"],
+  "pi": {
+    "extensions": ["./extensions"]
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/willnewby/pi-cocore"
+  }
+}
