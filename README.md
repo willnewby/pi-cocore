@@ -23,7 +23,6 @@ Once configured, Co/Core models appear in the model picker (`Ctrl+P`) alongside 
 | Qwen 2.5 (0.5B – 32B) | 32K – 128K |
 | Gemma 3 / 4 | 32K – 128K |
 | Llama 3.3 70B | 128K |
-| DeepSeek R1 | 128K (reasoning) |
 
 Capabilities (context window, max tokens, reasoning) are automatically derived from each model's ID.
 
